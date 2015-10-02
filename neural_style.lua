@@ -12,6 +12,7 @@ local cmd = torch.CmdLine()
 -- Basic options
 cmd:option('-style_image', 'examples/inputs/seated-nude.jpg',
            'Style target image')
+cmd:option('-style_blend_weights', 'nil')
 cmd:option('-content_image', 'examples/inputs/tubingen.jpg',
            'Content target image')
 cmd:option('-image_size', 512, 'Maximum height / width of generated image')
@@ -22,7 +23,10 @@ cmd:option('-content_weight', 5e0)
 cmd:option('-style_weight', 1e2)
 cmd:option('-tv_weight', 1e-3)
 cmd:option('-num_iterations', 1000)
+cmd:option('-normalize_gradients', false)
 cmd:option('-init', 'random', 'random|image')
+cmd:option('-optimizer', 'lbfgs', 'lbfgs|adam')
+cmd:option('-learning_rate', 1e1)
 
 -- Output options
 cmd:option('-print_iter', 50)
@@ -35,7 +39,14 @@ cmd:option('-pooling', 'max', 'max|avg')
 cmd:option('-proto_file', 'models/VGG_ILSVRC_19_layers_deploy.prototxt')
 cmd:option('-model_file', 'models/VGG_ILSVRC_19_layers.caffemodel')
 cmd:option('-backend', 'nn', 'nn|cudnn')
+cmd:option('-seed', -1)
 
+cmd:option('-content_layers', 'relu4_2', 'layers for content')
+cmd:option('-style_layers', 'relu1_1,relu2_1,relu3_1,relu4_1,relu5_1', 'layers for style')
+
+function nn.SpatialConvolutionMM:accGradParameters()
+  -- nop.  not needed by our net
+end
 
 local function main(params)
   if params.gpu >= 0 then
@@ -48,6 +59,7 @@ local function main(params)
 
   if params.backend == 'cudnn' then
     require 'cudnn'
+    cudnn.SpatialConvolution.accGradParameters = nn.SpatialConvolutionMM.accGradParameters -- ie: nop
   end
   
   local cnn = loadcaffe_wrap.load(params.proto_file, params.model_file, params.backend):float()
@@ -55,24 +67,53 @@ local function main(params)
     cnn:cuda()
   end
   
-  local content_image = grayscale_to_rgb(image.load(params.content_image))
+  local content_image = image.load(params.content_image, 3)
   content_image = image.scale(content_image, params.image_size, 'bilinear')
   local content_image_caffe = preprocess(content_image):float()
   
-  local style_image = grayscale_to_rgb(image.load(params.style_image))
   local style_size = math.ceil(params.style_scale * params.image_size)
-  style_image = image.scale(style_image, style_size, 'bilinear')
-  local style_image_caffe = preprocess(style_image):float()
-  
-  if params.gpu >= 0 then
-    content_image_caffe = content_image_caffe:cuda()
-    style_image_caffe = style_image_caffe:cuda()
+  local style_image_list = params.style_image:split(',')
+  local style_images_caffe = {}
+  for _, img_path in ipairs(style_image_list) do
+    local img = image.load(img_path, 3)
+    img = image.scale(img, style_size, 'bilinear')
+    local img_caffe = preprocess(img):float()
+    table.insert(style_images_caffe, img_caffe)
+  end
+
+  -- Handle style blending weights for multiple style inputs
+  local style_blend_weights = nil
+  if params.style_blend_weights == 'nil' then
+    -- Style blending not specified, so use equal weighting
+    style_blend_weights = {}
+    for i = 1, #style_image_list do
+      table.insert(style_blend_weights, 1.0)
+    end
+  else
+    style_blend_weights = params.style_blend_weights:split(',')
+    assert(#style_blend_weights == #style_image_list,
+      '-style_blend_weights and -style_images must have the same number of elements')
+  end
+  -- Normalize the style blending weights so they sum to 1
+  local style_blend_sum = 0
+  for i = 1, #style_blend_weights do
+    style_blend_weights[i] = tonumber(style_blend_weights[i])
+    style_blend_sum = style_blend_sum + style_blend_weights[i]
+  end
+  for i = 1, #style_blend_weights do
+    style_blend_weights[i] = style_blend_weights[i] / style_blend_sum
   end
   
-  -- Hardcode these for now
-  local content_layers = {23}
-  local style_layers = {2, 7, 12, 21, 30}
-  local style_layer_weights = {1e0, 1e0, 1e0, 1e0, 1e0}
+
+  if params.gpu >= 0 then
+    content_image_caffe = content_image_caffe:cuda()
+    for i = 1, #style_images_caffe do
+      style_images_caffe[i] = style_images_caffe[i]:cuda()
+    end
+  end
+  
+  local content_layers = params.content_layers:split(",")
+  local style_layers = params.style_layers:split(",")
 
   -- Set up the network, inserting style and content loss modules
   local content_losses, style_losses = {}, {}
@@ -88,6 +129,7 @@ local function main(params)
   for i = 1, #cnn do
     if next_content_idx <= #content_layers or next_style_idx <= #style_layers then
       local layer = cnn:get(i)
+      local name = layer.name
       local layer_type = torch.type(layer)
       local is_pooling = (layer_type == 'cudnn.SpatialMaxPooling' or layer_type == 'nn.SpatialMaxPooling')
       if is_pooling and params.pooling == 'avg' then
@@ -102,9 +144,11 @@ local function main(params)
       else
         net:add(layer)
       end
-      if i == content_layers[next_content_idx] then
+      if name == content_layers[next_content_idx] then
+        print("Setting up content layer", i, ":", layer.name)
         local target = net:forward(content_image_caffe):clone()
-        local loss_module = nn.ContentLoss(params.content_weight, target):float()
+        local norm = params.normalize_gradients
+        local loss_module = nn.ContentLoss(params.content_weight, target, norm):float()
         if params.gpu >= 0 then
           loss_module:cuda()
         end
@@ -112,16 +156,26 @@ local function main(params)
         table.insert(content_losses, loss_module)
         next_content_idx = next_content_idx + 1
       end
-      if i == style_layers[next_style_idx] then
+      if name == style_layers[next_style_idx] then
+        print("Setting up style layer  ", i, ":", layer.name)
         local gram = GramMatrix():float()
         if params.gpu >= 0 then
           gram = gram:cuda()
         end
-        local target_features = net:forward(style_image_caffe):clone()
-        local target = gram:forward(target_features)
-        target:div(target_features:nElement())
-        local weight = params.style_weight * style_layer_weights[next_style_idx]
-        local loss_module = nn.StyleLoss(weight, target):float()
+        local target = nil
+        for i = 1, #style_images_caffe do
+          local target_features = net:forward(style_images_caffe[i]):clone()
+          local target_i = gram:forward(target_features):clone()
+          target_i:div(target_features:nElement())
+          target_i:mul(style_blend_weights[i])
+          if i == 1 then
+            target = target_i
+          else
+            target:add(target_i)
+          end
+        end
+        local norm = params.normalize_gradients
+        local loss_module = nn.StyleLoss(params.style_weight, target, norm):float()
         if params.gpu >= 0 then
           loss_module:cuda()
         end
@@ -134,9 +188,20 @@ local function main(params)
 
   -- We don't need the base CNN anymore, so clean it up to save memory.
   cnn = nil
+  for i=1,#net.modules do
+    local module = net.modules[i]
+    if torch.type(module) == 'nn.SpatialConvolutionMM' then
+        -- remote these, not used, but uses gpu memory
+        module.gradWeight = nil
+        module.gradBias = nil
+    end
+  end
   collectgarbage()
   
   -- Initialize the image
+  if params.seed >= 0 then
+    torch.manualSeed(params.seed)
+  end
   local img = nil
   if params.init == 'random' then
     img = torch.randn(content_image:size()):float():mul(0.001)
@@ -156,10 +221,19 @@ local function main(params)
   local dy = img.new(#y):zero()
 
   -- Declaring this here lets us access it in maybe_print
-  local optim_state = {
-    maxIter = params.num_iterations,
-    verbose=true,
-  }
+  local optim_state = nil
+  if params.optimizer == 'lbfgs' then
+    optim_state = {
+      maxIter = params.num_iterations,
+      verbose=true,
+    }
+  elseif params.optimizer == 'adam' then
+    optim_state = {
+      learningRate = params.learning_rate,
+    }
+  else
+    error(string.format('Unrecognized optimizer "%s"', params.optimizer))
+  end
 
   local function maybe_print(t, loss)
     local verbose = (params.print_iter > 0 and t % params.print_iter == 0)
@@ -215,15 +289,22 @@ local function main(params)
   end
 
   -- Run optimization.
-  local x, losses = optim.lbfgs(feval, img, optim_state)
+  if params.optimizer == 'lbfgs' then
+    print('Running optimization with L-BFGS')
+    local x, losses = optim.lbfgs(feval, img, optim_state)
+  elseif params.optimizer == 'adam' then
+    print('Running optimization with ADAM')
+    for t = 1, params.num_iterations do
+      local x, losses = optim.adam(feval, img, optim_state)
+    end
+  end
 end
   
 
 function build_filename(output_image, iteration)
-  local idx = string.find(output_image, '%.')
-  local basename = string.sub(output_image, 1, idx - 1)
-  local ext = string.sub(output_image, idx)
-  return string.format('%s_%d%s', basename, iteration, ext)
+  local ext = paths.extname(output_image)
+  local basename = paths.basename(output_image, ext)
+  return string.format('%s_%d.%s', basename, iteration, ext)
 end
 
 
@@ -237,16 +318,6 @@ function preprocess(img)
   mean_pixel = mean_pixel:view(3, 1, 1):expandAs(img)
   img:add(-1, mean_pixel)
   return img
-end
-
-
-function grayscale_to_rgb(img)
-  local c, h, w = img:size(1), img:size(2), img:size(3)
-  if c == 1 then
-    return img:expand(3, h, w):contiguous()
-  else
-    return img
-  end
 end
 
 
@@ -264,10 +335,11 @@ end
 -- Define an nn Module to compute content loss in-place
 local ContentLoss, parent = torch.class('nn.ContentLoss', 'nn.Module')
 
-function ContentLoss:__init(strength, target)
+function ContentLoss:__init(strength, target, normalize)
   parent.__init(self)
   self.strength = strength
   self.target = target
+  self.normalize = normalize or false
   self.loss = 0
   self.crit = nn.MSECriterion()
 end
@@ -285,6 +357,9 @@ end
 function ContentLoss:updateGradInput(input, gradOutput)
   if input:nElement() == self.target:nElement() then
     self.gradInput = self.crit:backward(input, self.target)
+  end
+  if self.normalize then
+    self.gradInput:div(torch.norm(self.gradInput, 1) + 1e-8)
   end
   self.gradInput:mul(self.strength)
   self.gradInput:add(gradOutput)
@@ -308,8 +383,9 @@ end
 -- Define an nn Module to compute style loss in-place
 local StyleLoss, parent = torch.class('nn.StyleLoss', 'nn.Module')
 
-function StyleLoss:__init(strength, target)
+function StyleLoss:__init(strength, target, normalize)
   parent.__init(self)
+  self.normalize = normalize or false
   self.strength = strength
   self.target = target
   self.loss = 0
@@ -332,6 +408,9 @@ function StyleLoss:updateGradInput(input, gradOutput)
   local dG = self.crit:backward(self.G, self.target)
   dG:div(input:nElement())
   self.gradInput = self.gram:backward(input, dG)
+  if self.normalize then
+    self.gradInput:div(torch.norm(self.gradInput, 1) + 1e-8)
+  end
   self.gradInput:mul(self.strength)
   self.gradInput:add(gradOutput)
   return self.gradInput
